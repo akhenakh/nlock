@@ -18,6 +18,7 @@ const (
 	// DefaultRetryInterval is the default interval to wait before retrying acquisition.
 	DefaultRetryInterval = 250 * time.Millisecond
 	// DefaultKeepAliveIntervalFactor is the factor of TTL used for the keep-alive interval (TTL / factor).
+	// A factor of 3 means the keep-alive will run at 1/3 of the TTL duration.
 	DefaultKeepAliveIntervalFactor = 3
 )
 
@@ -32,12 +33,13 @@ var (
 
 // Options configure the LockManager and lock acquisition.
 type Options struct {
-	TTL            time.Duration
-	RetryInterval  time.Duration
-	KeepAlive      bool // Enable automatic keep-alive for acquired locks
-	Logger         *slog.Logger
-	BucketName     string
-	BucketReplicas int
+	TTL                     time.Duration
+	RetryInterval           time.Duration
+	KeepAlive               bool // Enable automatic keep-alive for acquired locks
+	KeepAliveIntervalFactor int  // Factor of TTL for keep-alive interval (TTL / factor)
+	Logger                  *slog.Logger
+	BucketName              string
+	BucketReplicas          int
 }
 
 // Option is a function type for setting LockManager options.
@@ -67,6 +69,18 @@ func WithRetryInterval(interval time.Duration) Option {
 func WithKeepAlive(enable bool) Option {
 	return func(o *Options) {
 		o.KeepAlive = enable
+	}
+}
+
+// WithKeepAliveIntervalFactor sets the factor of the lock TTL to use for the keep-alive interval.
+// The interval is calculated as TTL / factor. A smaller factor means more frequent refreshes.
+// Defaults to 3. Must be 2 or greater.
+func WithKeepAliveIntervalFactor(factor int) Option {
+	return func(o *Options) {
+		// Factor must be at least 2 to ensure refresh happens before TTL/2
+		if factor >= 2 {
+			o.KeepAliveIntervalFactor = factor
+		}
 	}
 }
 
@@ -123,12 +137,13 @@ type Lock struct {
 // It ensures the necessary NATS KV bucket exists with the configured TTL.
 func NewLockManager(ctx context.Context, js jetstream.JetStream, opts ...Option) (*LockManager, error) {
 	defOpts := Options{
-		TTL:            DefaultLockTTL,
-		RetryInterval:  DefaultRetryInterval,
-		KeepAlive:      true,
-		Logger:         slog.Default(),
-		BucketName:     "distributed_locks",
-		BucketReplicas: 1,
+		TTL:                     DefaultLockTTL,
+		RetryInterval:           DefaultRetryInterval,
+		KeepAlive:               true,
+		KeepAliveIntervalFactor: DefaultKeepAliveIntervalFactor,
+		Logger:                  slog.Default(),
+		BucketName:              "distributed_locks",
+		BucketReplicas:          1,
 	}
 
 	for _, opt := range opts {
@@ -137,6 +152,9 @@ func NewLockManager(ctx context.Context, js jetstream.JetStream, opts ...Option)
 
 	if defOpts.TTL <= 0 {
 		return nil, fmt.Errorf("lock TTL must be positive")
+	}
+	if defOpts.KeepAliveIntervalFactor < 2 {
+		return nil, fmt.Errorf("keep-alive interval factor must be 2 or greater")
 	}
 	if defOpts.BucketReplicas <= 0 {
 		return nil, fmt.Errorf("bucket replicas must be positive")
@@ -173,11 +191,7 @@ func (l *Lock) runKeepAlive(ctx context.Context) {
 	defer l.keepAliveWg.Done()
 	defer l.logger.Debug("Keep-alive goroutine stopped")
 
-	interval := l.manager.opts.TTL / DefaultKeepAliveIntervalFactor
-	if interval <= 0 {
-		l.logger.Warn("Keep-alive interval is non-positive, disabling keep-alive")
-		return // Should not happen if TTL is positive, but safety check
-	}
+	interval := l.manager.opts.TTL / time.Duration(l.manager.opts.KeepAliveIntervalFactor)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -187,7 +201,7 @@ func (l *Lock) runKeepAlive(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			l.logger.Info("Keep-alive context cancelled")
+			l.logger.Info("Keep-alive context cancelled", "reason", ctx.Err())
 			return // Stop keep-alive signaled by Release() or parent context cancellation
 		case <-ticker.C:
 			l.mu.RLock()
@@ -201,8 +215,10 @@ func (l *Lock) runKeepAlive(ctx context.Context) {
 
 			l.logger.Debug("Refreshing lock TTL", "revision", currentRevision)
 
-			// Use context with timeout for the update operation itself
-			updateCtx, updateCancel := context.WithTimeout(context.Background(), l.manager.opts.RetryInterval*2) // Use background context for NATS op
+			// Use the keep-alive's own context for the update operation.
+			// This ensures that if the keep-alive is cancelled (e.g., by Release),
+			// the NATS update call is also cancelled.
+			updateCtx, updateCancel := context.WithTimeout(ctx, l.manager.opts.RetryInterval*2)
 			newRevision, err := l.manager.kv.Update(updateCtx, l.key, ownerIDBytes, currentRevision)
 			updateCancel()
 
@@ -219,14 +235,11 @@ func (l *Lock) runKeepAlive(ctx context.Context) {
 				}
 				l.mu.Unlock()
 			} else {
-				// Update failed - lock might be lost (expired, deleted by someone else)
-				l.logger.Error("Failed to refresh lock TTL, lock may be lost", "error", err, "revision_tried", currentRevision)
-				// Mark the lock as potentially invalid by setting revision to 0? Or just stop keep-alive?
-				// Stopping keep-alive is safer, letting Release() handle final cleanup attempt.
-				// Optionally: signal lock loss via a channel if needed by the application.
-				l.mu.Lock()
-				l.revision = 0 // Indicate potential loss
-				l.mu.Unlock()
+				// Update failed - lock might be lost (expired, deleted, or network error).
+				// We don't change the local revision state. We just stop refreshing.
+				// The lock is now considered "lost". The next attempt to Release() will likely
+				// fail with a revision mismatch, which is the correct behavior.
+				l.logger.Error("Failed to refresh lock TTL, lock may be lost. Stopping keep-alive.", "error", err, "revision_tried", currentRevision)
 				return // Stop the keep-alive goroutine
 			}
 		}
@@ -247,10 +260,9 @@ func (m *LockManager) Acquire(ctx context.Context, key string) (*Lock, error) {
 
 	for {
 		// Attempt to create the lock key atomically
-		// Create() fails if key exists, returning ErrKeyExists (which wraps JSErrCodeStreamWrongLastSequence)
+		// Create() fails if key exists, returning ErrKeyExists.
 		revision, err := m.kv.Create(ctx, key, ownerIDBytes)
 		if err == nil {
-			// (Lock acquired successfully - code remains the same)
 			logger.Info("Lock acquired successfully", "revision", revision)
 			lock := &Lock{
 				manager:  m,
@@ -259,6 +271,7 @@ func (m *LockManager) Acquire(ctx context.Context, key string) (*Lock, error) {
 				revision: revision,
 				logger:   logger,
 			}
+			// Start keep-alive if enabled
 			if m.opts.KeepAlive && m.opts.TTL > 0 {
 				keepAliveCtx, cancel := context.WithCancel(context.Background())
 				lock.cancelKeepAlive = cancel
@@ -270,12 +283,8 @@ func (m *LockManager) Acquire(ctx context.Context, key string) (*Lock, error) {
 		}
 
 		// Check if the error specifically indicates the key already exists.
-		// Based on the jetstream errors source, ErrKeyExists wraps the underlying
-		// JSErrCodeStreamWrongLastSequence when Create expects sequence 0 but finds > 0.
 		if errors.Is(err, jetstream.ErrKeyExists) {
-			// Key exists, lock is held by someone else (or potentially stale)
-			logger.Debug("Lock already held (received ErrKeyExists), will retry", "error", err)
-			// Continue loop after delay, waiting for retry or context cancellation
+			logger.Debug("Lock already held, will retry", "error", err)
 		} else {
 			// A different error occurred (network, permissions, context cancelled during Create, etc.)
 			logger.Error("Failed to acquire lock due to unexpected error", "error", err)
@@ -286,6 +295,10 @@ func (m *LockManager) Acquire(ctx context.Context, key string) (*Lock, error) {
 		select {
 		case <-ctx.Done():
 			logger.Warn("Lock acquisition cancelled or timed out", "error", ctx.Err())
+			// Check if the original error was also context-related to provide a better final error
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
 			return nil, ErrLockAcquireTimeout
 		case <-retryTicker.C:
 			logger.Debug("Retrying lock acquisition")
@@ -299,7 +312,7 @@ func (m *LockManager) Acquire(ctx context.Context, key string) (*Lock, error) {
 func (l *Lock) Release(ctx context.Context) error {
 	l.logger.Debug("Attempting to release lock")
 
-	// Stop the keep-alive goroutine first
+	// Stop the keep-alive goroutine first to prevent race conditions
 	if l.cancelKeepAlive != nil {
 		l.logger.Debug("Signalling keep-alive goroutine to stop")
 		l.cancelKeepAlive()
@@ -308,10 +321,9 @@ func (l *Lock) Release(ctx context.Context) error {
 		l.logger.Debug("Keep-alive goroutine finished")
 	}
 
-	// Atomically delete the key if we still hold the correct revision
 	l.mu.Lock()
 	currentRevision := l.revision
-	l.revision = 0 // Mark as released locally immediately
+	l.revision = 0 // Mark as released locally to prevent multiple release attempts
 	l.mu.Unlock()
 
 	if currentRevision == 0 {
@@ -323,27 +335,26 @@ func (l *Lock) Release(ctx context.Context) error {
 	// Use LastRevision option to ensure we only delete if we are the last writer
 	err := l.manager.kv.Delete(ctx, l.key, jetstream.LastRevision(currentRevision))
 
-	// Handle potential errors during delete
 	if err == nil {
 		l.logger.Info("Lock released successfully")
 		return nil
 	}
 
+	// Key not found - likely expired via TTL or deleted by another process.
+	// From the caller's perspective, the lock is released.
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
-		// Key not found - likely expired TTL or deleted by someone else. Still "released".
-		l.logger.Warn("Lock key not found during release, likely expired or released by another process", "revision_tried", currentRevision)
-		return nil // Considered successful release from this instance's perspective
+		l.logger.Warn("Lock key not found during release, likely expired", "revision_tried", currentRevision)
+		return nil
 	}
 
-	// Check if the error indicates the expected revision was wrong.
-	// Delete() with LastRevision() option also returns ErrKeyExists if the sequence doesn't match,
-	// as ErrKeyExists wraps the underlying JSErrCodeStreamWrongLastSequence code (10071).
+	// Revision mismatch - someone else acquired the lock after our keep-alive failed or expired.
+	// This means we no longer hold the lock.
 	if errors.Is(err, jetstream.ErrKeyExists) {
-		l.logger.Error("Failed to release lock: revision mismatch (received ErrKeyExists)", "error", err, "expected_revision", currentRevision)
-		return fmt.Errorf("%w: revision mismatch on delete (%v)", ErrLockNotHeld, err) // Include original err for detail
+		l.logger.Error("Failed to release lock: revision mismatch. The lock was likely lost.", "error", err, "expected_revision", currentRevision)
+		return fmt.Errorf("%w: revision mismatch on delete (%v)", ErrLockNotHeld, err)
 	}
 
-	// Other unexpected errors (network, permissions, context cancelled, etc.)
+	// Other unexpected errors (network, permissions, etc.)
 	l.logger.Error("Failed to delete lock key due to unexpected error", "error", err, "revision_tried", currentRevision)
 	return fmt.Errorf("failed to delete lock key %q: %w", l.key, err)
 }

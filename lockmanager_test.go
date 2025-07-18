@@ -73,8 +73,6 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 }
 
-// --- Test Cases (Remain Largely the Same) ---
-
 func TestAcquireRelease(t *testing.T) {
 	js, cleanup := setupTestServer(t) // Use the new helper
 	defer cleanup()
@@ -305,8 +303,9 @@ func TestKeepAlive(t *testing.T) {
 	js, cleanup := setupTestServer(t) // Use the new helper
 	defer cleanup()
 
-	lockTTL := 2 * time.Second  // Short TTL for testing keep-alive
-	testDuration := lockTTL * 3 // Hold lock longer than TTL
+	lockTTL := 3 * time.Second  // Short TTL for testing keep-alive
+	keepAliveFactor := 2        // More frequent refresh (interval = 3s / 2 = 1.5s)
+	testDuration := lockTTL * 2 // Hold lock longer than TTL
 
 	// Overall test context timeout
 	ctx, cancel := context.WithTimeout(context.Background(), testDuration+5*time.Second)
@@ -315,7 +314,8 @@ func TestKeepAlive(t *testing.T) {
 	manager, err := NewLockManager(ctx, js,
 		WithLogger(testLogger()),
 		WithTTL(lockTTL),
-		WithKeepAlive(true), // Explicitly enable
+		WithKeepAlive(true),
+		WithKeepAliveIntervalFactor(keepAliveFactor),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create LockManager: %v", err)
@@ -376,7 +376,7 @@ func TestKeepAlive(t *testing.T) {
 }
 
 func TestTTLExpiry(t *testing.T) {
-	js, cleanup := setupTestServer(t) // Use the new helper
+	js, cleanup := setupTestServer(t)
 	defer cleanup()
 
 	lockTTL := 1 * time.Second                     // Short TTL
@@ -450,7 +450,7 @@ func TestTTLExpiry(t *testing.T) {
 }
 
 func TestReleaseNotHeld(t *testing.T) {
-	js, cleanup := setupTestServer(t) // Use the new helper
+	js, cleanup := setupTestServer(t)
 	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -494,23 +494,22 @@ func TestReleaseNotHeld(t *testing.T) {
 }
 
 func TestKeepAliveLoss(t *testing.T) {
-	js, cleanup := setupTestServer(t) // Use the new helper
+	js, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	lockTTL := 1 * time.Second                                                                     // Use a slightly shorter TTL to make test faster
-	keepAliveInterval := lockTTL * DefaultKeepAliveIntervalFactor / DefaultKeepAliveIntervalFactor // Calculate interval based on lock's logic
-	if keepAliveInterval == 0 {
-		keepAliveInterval = 100 * time.Millisecond
-	} // Prevent zero interval
+	lockTTL := 2 * time.Second
+	keepAliveFactor := 2
+	keepAliveInterval := lockTTL / time.Duration(keepAliveFactor) // 1s interval
 
 	// Overall test context
-	ctx, cancel := context.WithTimeout(context.Background(), (lockTTL*3)+(keepAliveInterval*2)+time.Second) // Ensure enough time
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	manager, err := NewLockManager(ctx, js,
 		WithLogger(testLogger()),
 		WithTTL(lockTTL),
 		WithKeepAlive(true),
+		WithKeepAliveIntervalFactor(keepAliveFactor),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create LockManager: %v", err)
@@ -519,67 +518,41 @@ func TestKeepAliveLoss(t *testing.T) {
 	lockKey := "test-lock-keepalive-loss"
 
 	// Acquire lock
-	acquireCtx, acquireCancel := context.WithTimeout(ctx, 2*time.Second)
-	defer acquireCancel()
-	lock, err := manager.Acquire(acquireCtx, lockKey)
+	lock, err := manager.Acquire(ctx, lockKey)
 	if err != nil {
 		t.Fatalf("Failed to acquire lock: %v", err)
 	}
 	t.Logf("Lock acquired: OwnerID=%s, Revision=%d", lock.OwnerID(), lock.revision)
 
-	// Wait for keep-alive to potentially run once or twice to be safe
-	time.Sleep(keepAliveInterval + 50*time.Millisecond)
+	// Wait for at least one keep-alive to run successfully
+	time.Sleep(keepAliveInterval + 250*time.Millisecond)
 
 	// Manually delete the key from KV to simulate loss/expiry
 	t.Logf("Manually deleting lock key from KV...")
-	deleteCtx, deleteCancel := context.WithTimeout(ctx, 1*time.Second)
-	defer deleteCancel()
-	// Use Purge to ensure it's gone immediately for the test
-	err = manager.kv.Purge(deleteCtx, lockKey)
-	if err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
-		// It might already be gone if TTL is very short or due to timing
-		t.Logf("Note: Manual delete/purge failed (might be ok if already gone): %v", err)
-	} else {
-		t.Logf("Manual purge successful or key already gone.")
+	purgeCtx, purgeCancel := context.WithTimeout(ctx, 1*time.Second)
+	defer purgeCancel()
+	if err := manager.kv.Purge(purgeCtx, lockKey); err != nil {
+		t.Fatalf("Failed to purge key to simulate lock loss: %v", err)
 	}
+	t.Logf("Manual purge successful.")
 
-	// Wait for the next keep-alive attempt to fail
+	// Wait for the next keep-alive attempt to fail and stop the keep-alive goroutine
 	t.Logf("Waiting for keep-alive to detect loss (approx %v)...", keepAliveInterval*2)
-	time.Sleep(keepAliveInterval * 2) // Ensure enough time for keep-alive to run and fail
+	time.Sleep(keepAliveInterval * 2)
 
-	// Check the lock's internal state (best effort - check revision)
-	lock.mu.RLock()
-	currentRevision := lock.revision
-	lock.mu.RUnlock()
-
-	if currentRevision != 0 {
-		// Give it one more short wait in case of timing issues
-		time.Sleep(keepAliveInterval / 2)
-		lock.mu.RLock()
-		currentRevision = lock.revision
-		lock.mu.RUnlock()
-		if currentRevision != 0 {
-			t.Errorf("Expected lock revision to be 0 after keep-alive failure, but got: %d", currentRevision)
-			// Also check KV just in case
-			checkCtx, checkCancel := context.WithTimeout(ctx, 500*time.Millisecond)
-			defer checkCancel()
-			entry, kvErr := manager.kv.Get(checkCtx, lockKey)
-			if kvErr == nil {
-				t.Logf("KV state: Key=%s, Value=%s, Revision=%d", entry.Key(), string(entry.Value()), entry.Revision())
-			} else {
-				t.Logf("KV state check shows error (expected if deleted): %v", kvErr)
-			}
-		}
-	}
-
-	if currentRevision == 0 {
-		t.Logf("Keep-alive correctly detected lock loss (revision is 0)")
-	}
-
-	// Attempting to release should now return ErrLockNotHeld
-	releaseCtx, releaseCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	// Attempting to release the lock should now fail because the keep-alive
+	// would have stopped, and the revision on the server is gone.
+	// The `Release` call will attempt a conditional delete on a non-existent key
+	// with a specific revision, which will fail.
+	releaseCtx, releaseCancel := context.WithTimeout(ctx, 1*time.Second)
 	defer releaseCancel()
 	err = lock.Release(releaseCtx)
+	if err == nil {
+		t.Fatalf("Expected release to fail after simulated lock loss, but it succeeded")
+	}
+
+	// The error should indicate the lock was not held, likely due to a revision mismatch
+	// or the key not being found, which our implementation wraps.
 	if !errors.Is(err, ErrLockNotHeld) {
 		t.Errorf("Expected ErrLockNotHeld on release after simulated loss, got: %v", err)
 	} else {
