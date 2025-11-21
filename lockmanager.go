@@ -30,6 +30,8 @@ var (
 	ErrLockNotHeld = errors.New("lock not held or already released/expired")
 	// ErrLockAlreadyLocked is a specific error type when creation fails because the key exists.
 	ErrLockAlreadyLocked = errors.New("lock key already exists")
+	// ErrLockHeld is returned by TryAcquire when the lock is currently held by another owner.
+	ErrLockHeld = errors.New("lock already held")
 )
 
 // Options configure the LockManager and lock acquisition.
@@ -355,6 +357,91 @@ func (m *LockManager) Acquire(ctx context.Context, key string) (*Lock, error) {
 		// For transient network errors, we might want to retry, but for now return error
 		return nil, fmt.Errorf("failed to create lock key %q: %w", key, err)
 	}
+}
+
+// TryAcquire attempts to acquire the lock exactly once without retrying.
+// If the lock is available, it returns the Lock object.
+// If the lock is already held, it returns ErrLockHeld.
+// If a network/infra error occurs, it returns that error.
+func (m *LockManager) TryAcquire(ctx context.Context, key string) (*Lock, error) {
+	ownerID := uuid.NewString()
+	logger := m.logger.With("lock_key", key, "owner_id", ownerID)
+	logger.Debug("Attempting to try-acquire lock (one-shot)")
+
+	ownerIDBytes := []byte(ownerID)
+
+	// Attempt to create the lock key atomically
+	revision, err := m.kv.Create(ctx, key, ownerIDBytes)
+	if err == nil {
+		if ctx.Err() != nil {
+			logger.Warn("Context cancelled immediately after lock acquisition. Rolling back.", "error", ctx.Err())
+			_ = m.kv.Delete(context.Background(), key, jetstream.LastRevision(revision))
+			return nil, ctx.Err()
+		}
+
+		logger.Info("Lock acquired successfully (try-lock)", "revision", revision)
+		lock := &Lock{
+			manager:  m,
+			key:      key,
+			ownerID:  ownerID,
+			revision: revision,
+			logger:   logger,
+		}
+		// Start keep-alive if enabled
+		if m.opts.KeepAlive && m.opts.TTL > 0 {
+			keepAliveCtx, cancel := context.WithCancel(context.Background())
+			lock.cancelKeepAlive = cancel
+			lock.keepAliveWg.Add(1)
+			go lock.runKeepAlive(keepAliveCtx)
+			logger.Debug("Keep-alive goroutine started")
+		}
+		return lock, nil
+	}
+
+	if errors.Is(err, jetstream.ErrKeyExists) {
+		return nil, ErrLockHeld
+	}
+
+	logger.Error("Failed to try-acquire lock due to unexpected error", "error", err)
+	return nil, fmt.Errorf("failed to create lock key %q: %w", key, err)
+}
+
+// Do executes the provided function 'fn' only if the lock for 'key' can be acquired immediately.
+//
+// Use this in clustered environments where multiple replicas run the same code,
+// but you only want one of them to execute the logic.
+//
+// Returns:
+// - executed (bool): true if the lock was acquired and fn was called, false if lock was busy.
+// - err (error): contains errors from NATS (during acquisition) or errors returned by 'fn'.
+func (m *LockManager) Do(ctx context.Context, key string, fn func(ctx context.Context) error) (executed bool, err error) {
+	lock, err := m.TryAcquire(ctx, key)
+	if err != nil {
+		if errors.Is(err, ErrLockHeld) {
+			// Lock is busy, simply return false (skipped) and no error
+			return false, nil
+		}
+		// Infrastructure/Network error
+		return false, err
+	}
+
+	// Ensure lock is released when function finishes or panics
+	defer func() {
+		// Use a detached context for release to ensure it runs even if the parent ctx is cancelled
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if releaseErr := lock.Release(releaseCtx); releaseErr != nil {
+			// We log this here because we can't easily return it if 'fn' also returned an error
+			m.logger.Error("Failed to release lock in Do", "key", key, "error", releaseErr)
+		}
+	}()
+
+	// Run the user function
+	if runErr := fn(ctx); runErr != nil {
+		return true, runErr
+	}
+
+	return true, nil
 }
 
 // Release attempts to release the acquired lock.

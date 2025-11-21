@@ -559,3 +559,50 @@ func TestKeepAliveLoss(t *testing.T) {
 		t.Logf("Release after simulated loss failed with expected error: %v", err)
 	}
 }
+
+func TestDo(t *testing.T) {
+	js, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	manager, err := NewLockManager(ctx, js, WithLogger(testLogger()))
+	if err != nil {
+		t.Fatalf("Failed to create LockManager: %v", err)
+	}
+
+	lockKey := "do-test-lock"
+
+	// 1. First call should execute
+	executed, err := manager.Do(ctx, lockKey, func(ctx context.Context) error {
+		t.Log("Executing critical section 1")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("First Do returned error: %v", err)
+	}
+	if !executed {
+		t.Fatal("First Do should have executed but returned false")
+	}
+
+	// 2. Acquire lock manually to block the next Do
+	holderLock, err := manager.Acquire(ctx, lockKey)
+	if err != nil {
+		t.Fatalf("Manual acquire failed: %v", err)
+	}
+	defer holderLock.Release(ctx)
+
+	// 3. Second call should skip (return false, nil) because lock is held
+	executed, err = manager.Do(ctx, lockKey, func(ctx context.Context) error {
+		t.Fatal("Second Do executed but should have been skipped")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Second Do returned error: %v", err)
+	}
+	if executed {
+		t.Fatal("Second Do reported execution true, expected false")
+	}
+	t.Log("Second Do skipped correctly")
+}
